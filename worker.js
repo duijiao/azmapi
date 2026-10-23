@@ -307,9 +307,13 @@ export default {
     const action = (requestUrl.searchParams.get("action") || "").toLowerCase();
     const q = (requestUrl.searchParams.get("q") || requestUrl.searchParams.get("wd") || "").trim();
     const page = Math.max(1, Math.min(1000, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1));
+    // Fast by default: detail-page image scraping is opt-in.
     const includeImages = !["0", "false", "no"].includes(
-      (requestUrl.searchParams.get("include_images") || "1").toLowerCase()
+      (requestUrl.searchParams.get("include_images") || "0").toLowerCase()
     );
+    // Every list endpoint returns at most 10 records by default; allow callers to tune 1-50.
+    const pageSize = Math.max(1, Math.min(50, Number.parseInt(requestUrl.searchParams.get("page_size") || "10", 10) || 10));
+    const scorePage = Math.max(1, Math.min(1000, Number.parseInt(requestUrl.searchParams.get("score_page") || "1", 10) || 1));
 
     try {
       const referenceInput = requestUrl.searchParams.get("ref") ||
@@ -334,14 +338,28 @@ export default {
         const songResult = await fetchScriptureSongs(refSlug, page);
         const songs = [];
         // Limit the number of per-song follow-up requests to keep one call bounded.
-        for (const song of songResult.songs.slice(0, 20)) {
+        for (const song of songResult.songs.slice(0, pageSize)) {
           const item = { ...song, scores: [], score_count: null };
           if (includeScores) {
             try {
-              const result = await fetchSongScores(song.song_id, true);
+              // First parse score metadata only. Fetch images only for the visible page and only on request.
+              const result = await fetchSongScores(song.song_id, false);
               item.song_url = result.song_url;
-              item.scores = result.scores;
               item.score_count = result.scores.length;
+              item.scores = result.scores.slice((scorePage - 1) * pageSize, scorePage * pageSize);
+              item.score_page = scorePage;
+              item.score_page_size = pageSize;
+              item.score_total_pages = Math.ceil(result.scores.length / pageSize);
+              if (includeImages) {
+                item.scores = await Promise.all(item.scores.map(async score => {
+                  try {
+                    const detail = await fetchHtml(score.score_url);
+                    return { ...score, score_url: detail.url, images: parseImages(detail.html, detail.url) };
+                  } catch (e) {
+                    return { ...score, image_error: String(e?.message || e) };
+                  }
+                }));
+              }
             } catch (e) {
               item.score_error = String(e?.message || e);
             }
@@ -354,6 +372,7 @@ export default {
           reference: referenceInput,
           reference_id: refSlug,
           page,
+          page_size: pageSize,
           count: songs.length,
           total_on_page: songResult.songs.length,
           songs,
@@ -390,10 +409,10 @@ export default {
           success: true,
           service: "zanmei-sheet-api",
           usage: {
-            search: "/?q=奇妙作为&page=1",
+            search: "/?q=奇妙作为&page=1&page_size=10",
             searchWithoutImages: "/?q=奇妙作为&page=1&include_images=0",
             detail: "/?id=49795",
-            scripture: "/scripture?reference=约翰福音3:16&page=1",
+            scripture: "/scripture?reference=约翰福音3:16&page=1&page_size=10",
             scriptureBySlug: "/scripture?ref=gen-c1-v1&page=1",
             scriptureWithoutScores: "/scripture?reference=创世记1:1&include_scores=0",
             health: "/health",
@@ -403,8 +422,9 @@ export default {
       }
 
       const result = await searchSheets(q, page);
+      const visibleRows = result.rows.slice(0, pageSize);
       const items = [];
-      for (const row of result.rows) {
+      for (const row of visibleRows) {
         const tabId = getTabId(row);
         let imageData = { images: [] };
         if (includeImages && tabId) {
@@ -431,6 +451,7 @@ export default {
         action: "search",
         query: q,
         page,
+        page_size: pageSize,
         total_pages: totalPages,
         count: items.length,
         items,
